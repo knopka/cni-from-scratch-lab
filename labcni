@@ -1,0 +1,118 @@
+#!/bin/bash
+# labcni — a minimal CNI plugin (spec 0.4.0): Linux bridge + file-based IPAM.
+#
+# Contract with the runtime:
+#   in:  env  CNI_COMMAND / CNI_CONTAINERID / CNI_NETNS / CNI_IFNAME / CNI_PATH
+#        stdin — JSON network config (our file from net.d plus whatever the runtime adds)
+#   out: stdout — JSON result (ADD/CHECK) or {"cniVersion","supportedVersions"} (VERSION)
+#        exit 0 = success; exit != 0 plus JSON {"code","msg"} on stdout = error
+#
+# Everything this plugin does is the same `ip` commands as in labs 1–2. No magic.
+set -euo pipefail
+
+LOG=/var/log/labcni.log
+STATE=/var/lib/labcni          # IPAM: one file per allocated IP, content = CNI_CONTAINERID
+CNI_VERSION="0.4.0"
+
+CONF=$(cat)                     # read stdin exactly once
+
+# 1. Log EVERYTHING the runtime sent us — the main teaching point of lab 7.
+{
+  echo "=== $(date '+%T') CNI_COMMAND=${CNI_COMMAND:-?}"
+  env | grep '^CNI_' | sort
+  echo "--- stdin:"
+  echo "$CONF" | jq . 2>/dev/null || echo "$CONF"
+} >> "$LOG"
+
+die() { echo "{\"cniVersion\":\"$CNI_VERSION\",\"code\":100,\"msg\":\"$1\"}"; exit 1; }
+
+# VERSION does not depend on the network config — answer right away.
+if [ "${CNI_COMMAND:-}" = "VERSION" ]; then
+  echo "{\"cniVersion\":\"$CNI_VERSION\",\"supportedVersions\":[\"0.3.0\",\"0.3.1\",\"0.4.0\"]}"
+  exit 0
+fi
+
+# 2. Network parameters from the config.
+BR=$(echo "$CONF"     | jq -r '.bridge  // "cni0"')
+SUBNET=$(echo "$CONF" | jq -r '.subnet  // empty');  [ -n "$SUBNET" ] || die "subnet missing in config"
+GW=$(echo "$CONF"     | jq -r '.gateway // empty');  [ -n "$GW" ]     || die "gateway missing in config"
+PREFIX=${SUBNET%.*}             # 172.16.0.0/24 -> 172.16.0
+BITS=${SUBNET#*/}               # 172.16.0.0/24 -> 24
+NS=$(basename "${CNI_NETNS:-}") # /var/run/netns/con1 -> con1  (`ip -n` only takes names from /var/run/netns)
+HOST_IF="veth$(echo -n "$CNI_CONTAINERID" | sha1sum | cut -c1-8)"
+mkdir -p "$STATE"
+
+alloc_ip() {                    # first free address in .2..254 -> lock file
+  local i ip
+  for i in $(seq 2 254); do
+    ip="$PREFIX.$i"
+    if [ ! -e "$STATE/$ip" ]; then
+      echo "$CNI_CONTAINERID" > "$STATE/$ip"; echo "$ip"; return
+    fi
+  done
+  return 1
+}
+find_ip() {                     # which IP was given to this container (for DEL/CHECK)
+  grep -lx "$CNI_CONTAINERID" "$STATE"/* 2>/dev/null | head -1 | xargs -r basename
+}
+
+case "${CNI_COMMAND:-}" in
+
+ADD)
+  # the bridge is created once — on the first ADD on this node (compare with lab 2)
+  if ! ip link show "$BR" &>/dev/null; then
+    ip link add "$BR" type bridge
+    ip addr add "$GW/$BITS" dev "$BR"
+    ip link set "$BR" up
+  fi
+
+  IP=$(alloc_ip) || die "no free IPs in $SUBNET"
+
+  # veth pair: one end goes straight into the container netns under the name the runtime asked for
+  ip link add "$HOST_IF" type veth peer name "$CNI_IFNAME" netns "$NS"
+  ip link set "$HOST_IF" master "$BR"
+  ip link set "$HOST_IF" up
+
+  ip -n "$NS" link set "$CNI_IFNAME" up
+  ip -n "$NS" link set lo up
+  ip -n "$NS" addr add "$IP/$BITS" dev "$CNI_IFNAME"
+  ip -n "$NS" route add default via "$GW" dev "$CNI_IFNAME"
+
+  MAC=$(ip -n "$NS" link show "$CNI_IFNAME" | awk '/link\/ether/{print $2}')
+
+  # 3. Result — the runtime caches this and feeds it back to us on CHECK/DEL as prevResult
+  cat <<EOF
+{
+  "cniVersion": "$CNI_VERSION",
+  "interfaces": [
+    { "name": "$BR" },
+    { "name": "$HOST_IF" },
+    { "name": "$CNI_IFNAME", "mac": "$MAC", "sandbox": "$CNI_NETNS" }
+  ],
+  "ips": [
+    { "version": "4", "address": "$IP/$BITS", "gateway": "$GW", "interface": 2 }
+  ],
+  "routes": [ { "dst": "0.0.0.0/0", "gw": "$GW" } ]
+}
+EOF
+  ;;
+
+DEL)
+  # DEL must be idempotent and must not fail even if the netns is already gone
+  IP=$(find_ip || true)
+  [ -n "$IP" ] && rm -f "$STATE/$IP"
+  ip link del "$HOST_IF" 2>/dev/null || true    # deleting one end destroys the pair
+  ;;
+
+CHECK)
+  # Verify only what we created ourselves: the interface exists and carries our IP
+  IP=$(find_ip) || die "no IP allocated for container $CNI_CONTAINERID"
+  ip -n "$NS" addr show "$CNI_IFNAME" 2>/dev/null | grep -q "inet $IP/" \
+    || die "$CNI_IFNAME in $NS does not have $IP"
+  ip link show "$HOST_IF" &>/dev/null || die "$HOST_IF missing on host"
+  ;;
+
+*)
+  die "unknown CNI_COMMAND: ${CNI_COMMAND:-}"
+  ;;
+esac
